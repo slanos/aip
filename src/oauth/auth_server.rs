@@ -2,7 +2,7 @@
 
 use crate::errors::OAuthError;
 use crate::oauth::{dpop::*, types::*};
-use crate::storage::traits::OAuthStorage;
+use crate::storage::traits::TransactionalStorage;
 use atproto_identity::key::KeyType;
 use atproto_oauth::jwk::{WrappedJsonWebKey, to_key_data};
 use axum::{
@@ -21,7 +21,7 @@ use url::Url;
 
 /// OAuth 2.1 Authorization Server
 pub struct AuthorizationServer {
-    pub storage: Arc<dyn OAuthStorage>,
+    pub storage: Arc<dyn TransactionalStorage>,
     dpop_validator: DPoPValidator,
     /// Authorization code lifetime
     auth_code_lifetime: Duration,
@@ -33,7 +33,7 @@ pub struct AuthorizationServer {
 
 impl AuthorizationServer {
     /// Create a new authorization server
-    pub fn new(storage: Arc<dyn OAuthStorage>, issuer: String) -> Self {
+    pub fn new(storage: Arc<dyn TransactionalStorage>, issuer: String) -> Self {
         let nonce_store = Box::new(crate::storage::MemoryNonceStorage::new());
         let dpop_validator = DPoPValidator::new(nonce_store);
 
@@ -91,14 +91,32 @@ impl AuthorizationServer {
             )));
         }
 
-        // Validate scope
+        // Validate scope using normalized comparison
         if let Some(ref requested_scope) = request.scope
             && let Some(ref client_scope) = client.scope
         {
-            let requested_scopes = parse_scope(requested_scope);
-            let allowed_scopes = parse_scope(client_scope);
+            let parsed_requested =
+                atproto_oauth::scopes::Scope::parse_multiple_reduced(requested_scope)
+                    .map_err(|e| {
+                        OAuthError::InvalidScope(format!("Invalid scope format: {}", e))
+                    })?;
 
-            if !requested_scopes.is_subset(&allowed_scopes) {
+            let parsed_allowed =
+                atproto_oauth::scopes::Scope::parse_multiple_reduced(client_scope).map_err(
+                    |e| OAuthError::InvalidScope(format!("Invalid client scope format: {}", e)),
+                )?;
+
+            let requested_normalized: std::collections::HashSet<String> = parsed_requested
+                .iter()
+                .map(|s| s.to_string_normalized())
+                .collect();
+
+            let allowed_normalized: std::collections::HashSet<String> = parsed_allowed
+                .iter()
+                .map(|s| s.to_string_normalized())
+                .collect();
+
+            if !requested_normalized.is_subset(&allowed_normalized) {
                 return Err(OAuthError::InvalidScope(
                     "Requested scope exceeds allowed scope".to_string(),
                 ));
@@ -187,6 +205,8 @@ impl AuthorizationServer {
         headers: &HeaderMap,
         client_auth: Option<ClientAuthentication>,
     ) -> Result<TokenResponse, OAuthError> {
+        tracing::debug!("Processing authorization code grant");
+
         let code = request
             .code
             .as_ref()
@@ -197,13 +217,21 @@ impl AuthorizationServer {
             .as_ref()
             .ok_or_else(|| OAuthError::InvalidRequest("Missing redirect URI".to_string()))?;
 
-        // Consume authorization code
+        tracing::debug!(code_prefix = %&code[..std::cmp::min(8, code.len())], "Looking up authorization code");
+
+        // Get authorization code without consuming (for validation)
         let auth_code: AuthorizationCode = self
             .storage
-            .consume_code(code)
+            .get_code(code)
             .await
-            .map_err(|e| OAuthError::ServerError(e.to_string()))?
-            .ok_or_else(|| OAuthError::InvalidGrant("Invalid authorization code".to_string()))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to get authorization code from storage");
+                OAuthError::ServerError(e.to_string())
+            })?
+            .ok_or_else(|| {
+                tracing::warn!(code_prefix = %&code[..std::cmp::min(8, code.len())], "Authorization code not found");
+                OAuthError::InvalidGrant("Invalid authorization code".to_string())
+            })?;
 
         // Verify redirect URI matches
         if auth_code.redirect_uri != *redirect_uri {
@@ -270,7 +298,7 @@ impl AuthorizationServer {
         let refresh_token = generate_token();
         let now = Utc::now();
 
-        // Store access token
+        // Build access token record
         let access_token_record = AccessToken {
             token: access_token.clone(),
             token_type: token_type.clone(),
@@ -285,19 +313,12 @@ impl AuthorizationServer {
             dpop_jkt,
         };
 
-        self.storage
-            .store_token(&access_token_record)
-            .await
-            .map_err(|e| {
-                OAuthError::ServerError(format!("Failed to store access token: {:?}", e))
-            })?;
-
-        // Store refresh token
+        // Build refresh token record
         let refresh_token_record = RefreshToken {
             token: refresh_token.clone(),
             access_token: access_token.clone(),
             client_id: client.client_id,
-            user_id: auth_code.user_id,
+            user_id: auth_code.user_id.clone(),
             session_id: auth_code.session_id.clone(),
             scope: auth_code.scope.clone(),
             nonce: auth_code.nonce.clone(),
@@ -305,12 +326,29 @@ impl AuthorizationServer {
             expires_at: Some(now + client.refresh_token_expiration),
         };
 
+        tracing::debug!(
+            client_id = %access_token_record.client_id,
+            user_id = ?access_token_record.user_id,
+            "Exchanging authorization code for tokens"
+        );
+
+        // Atomically exchange code for tokens
         self.storage
-            .store_refresh_token(&refresh_token_record)
+            .exchange_code_for_tokens(code, &access_token_record, Some(&refresh_token_record))
             .await
             .map_err(|e| {
-                OAuthError::ServerError(format!("Failed to store refresh token: {:?}", e))
+                tracing::error!(error = ?e, "Failed to exchange code for tokens");
+                OAuthError::ServerError(format!("Failed to exchange code for tokens: {:?}", e))
+            })?
+            .ok_or_else(|| {
+                tracing::warn!("Authorization code was already used or expired during exchange");
+                OAuthError::InvalidGrant("Authorization code already used or expired".to_string())
             })?;
+
+        tracing::debug!(
+            access_token_prefix = %&access_token[..std::cmp::min(8, access_token.len())],
+            "Token exchange completed successfully"
+        );
 
         Ok(TokenResponse::new(
             access_token,
@@ -351,13 +389,33 @@ impl AuthorizationServer {
             ));
         }
 
-        // Validate scope
+        // Validate scope using normalized comparison
         let granted_scope = if let Some(ref requested_scope) = request.scope {
             if let Some(ref client_scope) = client.scope {
-                let requested_scopes = parse_scope(requested_scope);
-                let allowed_scopes = parse_scope(client_scope);
+                let parsed_requested =
+                    atproto_oauth::scopes::Scope::parse_multiple_reduced(requested_scope)
+                        .map_err(|e| {
+                            OAuthError::InvalidScope(format!("Invalid scope format: {}", e))
+                        })?;
 
-                if !requested_scopes.is_subset(&allowed_scopes) {
+                let parsed_allowed =
+                    atproto_oauth::scopes::Scope::parse_multiple_reduced(client_scope).map_err(
+                        |e| {
+                            OAuthError::InvalidScope(format!("Invalid client scope format: {}", e))
+                        },
+                    )?;
+
+                let requested_normalized: std::collections::HashSet<String> = parsed_requested
+                    .iter()
+                    .map(|s| s.to_string_normalized())
+                    .collect();
+
+                let allowed_normalized: std::collections::HashSet<String> = parsed_allowed
+                    .iter()
+                    .map(|s| s.to_string_normalized())
+                    .collect();
+
+                if !requested_normalized.is_subset(&allowed_normalized) {
                     return Err(OAuthError::InvalidScope(
                         "Requested scope exceeds allowed scope".to_string(),
                     ));
@@ -419,10 +477,10 @@ impl AuthorizationServer {
             .as_ref()
             .ok_or_else(|| OAuthError::InvalidRequest("Missing refresh token".to_string()))?;
 
-        // Consume refresh token
+        // Get refresh token without consuming (for validation)
         let refresh_token_record: RefreshToken = self
             .storage
-            .consume_refresh_token(refresh_token)
+            .get_refresh_token(refresh_token)
             .await
             .map_err(|e| OAuthError::ServerError(e.to_string()))?
             .ok_or_else(|| OAuthError::InvalidGrant("Invalid refresh token".to_string()))?;
@@ -438,6 +496,7 @@ impl AuthorizationServer {
         // Authenticate client
         self.authenticate_client(&client, client_auth, &request)?;
 
+        // Get the old access token for session_iteration and token_type
         let old_access_token = self
             .storage
             .get_token(&refresh_token_record.access_token)
@@ -454,7 +513,7 @@ impl AuthorizationServer {
         let new_refresh_token = generate_token();
         let now = Utc::now();
 
-        // Store new access token
+        // Build new access token record
         let access_token_record = AccessToken {
             token: new_access_token.clone(),
             token_type: old_access_token.token_type,
@@ -469,31 +528,28 @@ impl AuthorizationServer {
             dpop_jkt: old_access_token.dpop_jkt,
         };
 
-        self.storage
-            .store_token(&access_token_record)
-            .await
-            .map_err(|e| {
-                OAuthError::ServerError(format!("Failed to store access token: {:?}", e))
-            })?;
-
-        // Store new refresh token
+        // Build new refresh token record
         let new_refresh_token_record = RefreshToken {
             token: new_refresh_token.clone(),
             access_token: new_access_token.clone(),
             client_id: client.client_id,
-            user_id: refresh_token_record.user_id,
-            session_id: refresh_token_record.session_id,
+            user_id: refresh_token_record.user_id.clone(),
+            session_id: refresh_token_record.session_id.clone(),
             scope: refresh_token_record.scope.clone(),
             nonce: refresh_token_record.nonce.clone(),
             created_at: now,
             expires_at: Some(now + client.refresh_token_expiration),
         };
 
+        // Atomically refresh tokens
         self.storage
-            .store_refresh_token(&new_refresh_token_record)
+            .refresh_tokens(refresh_token, &access_token_record, &new_refresh_token_record)
             .await
             .map_err(|e| {
-                OAuthError::ServerError(format!("Failed to store refresh token: {:?}", e))
+                OAuthError::ServerError(format!("Failed to refresh tokens: {:?}", e))
+            })?
+            .ok_or_else(|| {
+                OAuthError::InvalidGrant("Refresh token already used or expired".to_string())
             })?;
 
         Ok(TokenResponse::new(
@@ -754,6 +810,7 @@ pub struct AuthorizeQuery {
     pub request_uri: Option<String>, // For PAR (RFC 9126)
     pub login_hint: Option<String>,
     pub nonce: Option<String>,
+    pub prompt: Option<String>, // For app-password login: "app-password-login"
 }
 
 impl From<AuthorizeQuery> for AuthorizationRequest {
@@ -1151,7 +1208,7 @@ mod tests {
             redirect_uris: vec!["https://example.com/callback".to_string()],
             grant_types: vec![GrantType::AuthorizationCode],
             response_types: vec![ResponseType::Code],
-            scope: Some("read write".to_string()),
+            scope: Some("atproto transition:generic".to_string()),
             token_endpoint_auth_method: ClientAuthMethod::ClientSecretBasic,
             client_type: ClientType::Confidential,
             application_type: None,
@@ -1174,7 +1231,7 @@ mod tests {
             response_type: vec![ResponseType::Code],
             client_id: "test-client".to_string(),
             redirect_uri: "https://example.com/callback".to_string(),
-            scope: Some("read".to_string()),
+            scope: Some("atproto".to_string()),
             state: Some("test-state".to_string()),
             code_challenge: None,
             code_challenge_method: None,
@@ -1230,7 +1287,7 @@ mod tests {
 
         assert!(!token_response.access_token.is_empty());
         assert!(token_response.refresh_token.is_some());
-        assert_eq!(token_response.scope, Some("read".to_string()));
+        assert_eq!(token_response.scope, Some("atproto".to_string()));
     }
 
     #[tokio::test]
@@ -1262,7 +1319,7 @@ mod tests {
             redirect_uris: vec!["https://example.com/callback".to_string()],
             grant_types: vec![GrantType::AuthorizationCode, GrantType::ClientCredentials],
             response_types: vec![ResponseType::Code],
-            scope: Some("read write".to_string()),
+            scope: Some("atproto transition:generic".to_string()),
             token_endpoint_auth_method: ClientAuthMethod::PrivateKeyJwt,
             client_type: ClientType::Confidential,
             application_type: None,
@@ -1293,7 +1350,7 @@ mod tests {
             device_code: None,
             client_id: Some("test-private-key-jwt-client".to_string()),
             client_secret: None, // No secret for private_key_jwt
-            scope: Some("read write".to_string()),
+            scope: Some("atproto transition:generic".to_string()),
             client_assertion: None, // Will be in client_auth
             client_assertion_type: None,
         };

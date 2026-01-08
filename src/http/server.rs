@@ -5,14 +5,15 @@ use axum::{
     routing::{get, post},
 };
 use std::time::Duration;
-use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::DefaultMakeSpan;
+use tower_http::{classify::ServerErrorsFailureClass, cors::Any};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::Span;
 
 use super::{
     context::AppState,
     handler_app_password::{create_app_password_handler, get_app_password_handler},
+    handler_app_password_login::handle_app_password_login,
     handler_atprotocol_client_metadata::handle_atpoauth_client_metadata,
     handler_atprotocol_oauth_authorize::handle_oauth_authorize,
     handler_atprotocol_oauth_callback::handle_atpoauth_callback,
@@ -34,8 +35,9 @@ use super::{
         openid_configuration_handler,
     },
     handler_xrpc_clients::xrpc_clients_update_handler,
+    handler_xrpc_ready::xrpc_ready_handler,
 };
-use crate::http::middleware_auth::set_dpop_headers;
+use crate::http::{handler_well_known::did_handler, middleware_auth::set_dpop_headers};
 
 /// Build the application router
 pub fn build_router(ctx: AppState) -> Router {
@@ -54,6 +56,7 @@ pub fn build_router(ctx: AppState) -> Router {
     // Create OAuth routes for ATProtocol-backed authentication
     let mut oauth_routes = Router::new()
         .route("/authorize", get(handle_oauth_authorize))
+        .route("/authorize/app-password", post(handle_app_password_login))
         .route("/token", post(handle_oauth_token))
         .route("/device", post(device_authorization_handler))
         .route("/userinfo", get(get_userinfo_handler))
@@ -80,6 +83,7 @@ pub fn build_router(ctx: AppState) -> Router {
 
     // Create well-known discovery routes
     let well_known_routes = Router::new()
+        .route("/did.json", get(did_handler))
         .route(
             "/oauth-protected-resource",
             get(oauth_protected_resource_handler),
@@ -93,17 +97,7 @@ pub fn build_router(ctx: AppState) -> Router {
 
     // Configure CORS to allow React frontend access
     let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:3001"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-            "http://localhost:3002"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-            "https://psteniusubi.github.io"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-        ])
+        .allow_origin(Any)
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -134,20 +128,8 @@ pub fn build_router(ctx: AppState) -> Router {
             "/xrpc/tools.graze.aip.clients.Update",
             post(xrpc_clients_update_handler),
         )
+        .route("/xrpc/tools.graze.aip.ready", get(xrpc_ready_handler))
         .nest_service("/static", ServeDir::new(&ctx.config.http_static_path))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(
-                    DefaultMakeSpan::new()
-                        .level(tracing::Level::INFO)
-                        .include_headers(true),
-                )
-                .on_failure(
-                    |err: ServerErrorsFailureClass, _latency: Duration, _span: &Span| {
-                        tracing::error!(error = ?err, "Unhandled error: {err}");
-                    },
-                ),
-        )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(ctx)

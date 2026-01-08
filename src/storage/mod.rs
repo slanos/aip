@@ -13,7 +13,7 @@ pub mod postgres;
 
 // Re-export commonly used types and traits
 pub use inmemory::{MemoryNonceStorage, MemoryOAuthStorage};
-pub use key_provider::SimpleKeyProvider;
+pub use key_provider::{KeyProvider, SimpleKeyProvider};
 pub use traits::*;
 
 #[cfg(feature = "postgres")]
@@ -35,7 +35,7 @@ pub enum StorageBackend {
 /// Create a storage backend based on configuration
 pub async fn create_storage_backend(
     backend: StorageBackend,
-) -> std::result::Result<Arc<dyn OAuthStorage>, StorageError> {
+) -> std::result::Result<Arc<dyn TransactionalStorage + Send + Sync>, StorageError> {
     match backend {
         StorageBackend::Memory => Ok(Arc::new(MemoryOAuthStorage::new())),
         #[cfg(feature = "sqlite")]
