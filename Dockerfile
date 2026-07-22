@@ -32,7 +32,7 @@ RUN cargo build --release --bin aip --no-default-features --features ${FEATURES}
 # Build the client management CLI
 RUN cargo build --release --bin aip-client-management --no-default-features --features ${FEATURES}
 # Add the sqlx cli for running migrations in containers
-RUN cargo install sqlx-cli --root /app/.cargo --no-default-features --features native-tls,postgres
+RUN cargo install sqlx-cli --version "^0.8" --root /app/.cargo --no-default-features --features native-tls,postgres
 
 # Runtime stage using distroless
 FROM gcr.io/distroless/cc-debian12
