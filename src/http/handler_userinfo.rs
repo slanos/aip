@@ -249,6 +249,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_userinfo_preferred_username_from_profile() {
+        use crate::oauth::types::{AccessToken, TokenType};
+        use chrono::Utc;
+
+        let app_state = create_test_app_state();
+        let document = serde_json::from_value(json!({
+            "id": "did:plc:test123",
+            "alsoKnownAs": ["at://alice.example.com"],
+            "service": [],
+            "verificationMethod": []
+        }))
+        .unwrap();
+        app_state
+            .document_storage
+            .store_document(document)
+            .await
+            .unwrap();
+
+        let access_token = AccessToken {
+            token: "test-token".to_string(),
+            token_type: TokenType::Bearer,
+            client_id: "discourse".to_string(),
+            user_id: Some("did:plc:test123".to_string()),
+            session_id: None,
+            session_iteration: None,
+            scope: Some("atproto openid profile email transition:email".to_string()),
+            nonce: None,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            dpop_jkt: None,
+        };
+        let response = get_userinfo_handler(
+            State(app_state),
+            crate::http::middleware_auth::ExtractedAuth(access_token),
+        )
+        .await
+        .unwrap();
+        let body = serde_json::to_value(response.0).unwrap();
+
+        assert_eq!(body["preferred_username"], "alice.example.com");
+        assert_eq!(body["name"], "alice.example.com");
+        assert_eq!(body["sub"], "did:plc:test123");
+    }
+
+    #[tokio::test]
     async fn test_userinfo_handler_without_atproto_scopes() {
         use crate::oauth::types::{AccessToken, TokenType};
         use crate::storage::traits::AtpOAuthSession;

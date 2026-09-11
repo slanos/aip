@@ -345,7 +345,10 @@ pub async fn build_openid_claims_with_document_info(
         let handle = document.handles().map(|h| h.to_string());
         let pds_endpoint = document.pds_endpoints().first().map(|v| v.to_string());
 
-        claims = claims.with_name(handle).with_pds_endpoint(pds_endpoint);
+        claims = claims
+            .with_preferred_username(handle.clone())
+            .with_name(handle)
+            .with_pds_endpoint(pds_endpoint);
     }
 
     // Add email information if we can provide it
@@ -426,6 +429,61 @@ mod tests {
     use atproto_identity::{resolve::HickoryDnsResolver, storage_lru::LruDidDocumentStorage};
     use atproto_oauth::storage_lru::LruOAuthRequestStorage;
     use std::{num::NonZeroUsize, sync::Arc};
+
+    #[tokio::test]
+    async fn test_preferred_username_requires_profile_and_atproto_scopes() {
+        let document = serde_json::from_value(serde_json::json!({
+            "id": "did:plc:test123",
+            "alsoKnownAs": ["at://alice.example.com"],
+            "service": [],
+            "verificationMethod": []
+        }))
+        .unwrap();
+
+        for scopes in [
+            HashSet::from([Scope::Atproto, Scope::OpenId]),
+            HashSet::from([Scope::OpenId, Scope::Profile]),
+        ] {
+            let claims = build_openid_claims_with_document_info(
+                &reqwest::Client::new(),
+                OpenIDClaims::new_userinfo("did:plc:test123".to_string()),
+                &document,
+                &scopes,
+                None,
+            )
+            .await
+            .unwrap();
+            let response = serde_json::to_value(claims).unwrap();
+
+            assert!(response.get("preferred_username").is_none());
+            assert_eq!(response["sub"], "did:plc:test123");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preferred_username_omitted_without_handle() {
+        let document = serde_json::from_value(serde_json::json!({
+            "id": "did:plc:test123",
+            "alsoKnownAs": [],
+            "service": [],
+            "verificationMethod": []
+        }))
+        .unwrap();
+        let scopes = HashSet::from([Scope::Atproto, Scope::OpenId, Scope::Profile]);
+        let claims = build_openid_claims_with_document_info(
+            &reqwest::Client::new(),
+            OpenIDClaims::new_userinfo("did:plc:test123".to_string()),
+            &document,
+            &scopes,
+            None,
+        )
+        .await
+        .unwrap();
+        let response = serde_json::to_value(claims).unwrap();
+
+        assert!(response.get("preferred_username").is_none());
+        assert_eq!(response["sub"], "did:plc:test123");
+    }
 
     fn create_test_app_state() -> AppState {
         let oauth_storage = Arc::new(MemoryOAuthStorage::new());

@@ -131,6 +131,30 @@ sqlx migrate run --database-url postgresql://aip:aip_dev_password@localhost:5434
 sqlx migrate run --database-url sqlite://aip.db --source migrations/sqlite
 ```
 
+## Discourse OpenID Connect signup
+
+Discourse reads `preferred_username` from the UserInfo response to suggest a forum
+username. AIP returns the ATProtocol handle in this claim when both `profile` and
+`atproto` are granted. The account identifier (`sub`) remains the DID. If the DID
+document has no handle, the username claim is omitted.
+
+To enable automatic signup after deploying this version:
+
+1. Add `profile` to the Discourse client's registered scopes in AIP, preserving its
+   other settings. Changing only AIP's globally supported scopes does not update
+   an existing client registration.
+2. Set Discourse's `openid_connect_authorize_scope` to match the registered scopes.
+   For the existing email integration, use
+   `atproto openid profile email transition:email`.
+3. Enable `auth_skip_create_confirm`. Keep `auth_overrides_username` disabled so
+   existing forum usernames are preserved and users can edit the signup field
+   if automatic signup cannot complete.
+4. Verify signup with an account that has never joined the forum, then verify
+   that an existing account still logs into the same forum user.
+
+While waiting for deployment, disabling both `auth_overrides_username` and
+`auth_skip_create_confirm` allows users to choose a username on the signup form.
+
 ## Examples
 
 The repository includes several example applications demonstrating different OAuth flows:
