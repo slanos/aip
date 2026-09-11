@@ -98,7 +98,7 @@ pub async fn openid_configuration_handler(State(state): State<AppState>) -> Json
         "id_token_signing_alg_values_supported": ["ES256"],
         "userinfo_signed_response_alg": ["ES256"],
         "scopes_supported": state.config.oauth_supported_scopes.as_strings(),
-        "claims_supported": ["iss", "sub", "aud", "exp", "iat", "auth_time", "nonce", "at_hash", "c_hash", "email", "did", "name", "profile", "pds_endpoint"],
+        "claims_supported": ["iss", "sub", "aud", "exp", "iat", "auth_time", "nonce", "at_hash", "c_hash", "email", "did", "name", "preferred_username", "profile", "pds_endpoint"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "response_modes_supported": ["query", "fragment"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none", "private_key_jwt"],
@@ -319,6 +319,12 @@ mod tests {
         assert!(metadata.get("jwks_uri").is_some());
         assert!(metadata.get("response_types_supported").is_some());
         assert!(metadata.get("subject_types_supported").is_some());
+        assert!(
+            metadata["claims_supported"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("preferred_username"))
+        );
         assert!(
             metadata
                 .get("id_token_signing_alg_values_supported")

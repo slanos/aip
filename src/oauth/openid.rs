@@ -50,6 +50,10 @@ pub struct OpenIDClaims {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
+    /// Preferred username - The user's ATProtocol handle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+
     /// Profile - The user's profile URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -115,6 +119,7 @@ impl OpenIDClaims {
             c_hash: None,
             did: None,
             name: None,
+            preferred_username: None,
             profile: None,
             pds_endpoint: None,
             email: None,
@@ -142,6 +147,7 @@ impl OpenIDClaims {
             c_hash: None,
             did: None,
             name: None,
+            preferred_username: None,
             profile: None,
             pds_endpoint: None,
             email: None,
@@ -195,6 +201,12 @@ impl OpenIDClaims {
         {
             self.profile = Some(format!("https://bsky.app/profile/{}", name));
         }
+        self
+    }
+
+    /// Set the preferred username from an available ATProtocol handle
+    pub fn with_preferred_username(mut self, handle: Option<String>) -> Self {
+        self.preferred_username = handle.filter(|value| !value.is_empty());
         self
     }
 
